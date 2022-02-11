@@ -72,6 +72,7 @@ def main():
         org=args.influxdb_org)
     logging.info("connected to influxdb")
 
+    # TODO(sean) switch to using batch mode
     writer = client.write_api(write_options=SYNCHRONOUS)
 
     def message_handler(ch, method, properties, body):
@@ -94,6 +95,8 @@ def main():
             logging.info("dropping invalid message: username (%s) doesn't match node meta (%s) - ", msg.meta["node"], properties.user_id)
             ch.basic_ack(method.delivery_tag)
             return
+
+        logging.debug("creating record for msg: %s value-type: %s", msg, type(msg.value))
 
         record = {
             "measurement": msg.name,
