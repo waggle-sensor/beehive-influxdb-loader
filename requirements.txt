@@ -1,0 +1,3 @@
+pywagglemsg>=0.3.0
+influxdb_client
+pika
