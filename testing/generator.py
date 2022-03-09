@@ -23,4 +23,4 @@ with pika.BlockingConnection(params) as conn:
         body = wagglemsg.dump(msg)
         properties = pika.BasicProperties(user_id="node-0000000000000001")
         ch.basic_publish("waggle.msg", "", body, properties)
-        time.sleep(0.1)
+        time.sleep(0.01)

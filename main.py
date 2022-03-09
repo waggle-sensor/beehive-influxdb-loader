@@ -99,6 +99,7 @@ class MessageHandler:
                 logging.error("error when writing batch: %s", exc.message)
 
         # ack entire batch
+        logging.info("acking batch")
         for ch, method, properties, body in self.batch:
             ch.basic_ack(method.delivery_tag)
 
