@@ -1,11 +1,13 @@
 import argparse
 import pika
-import influxdb_client
+from influxdb_client import InfluxDBClient
+from influxdb_client.client.exceptions import InfluxDBError
 from influxdb_client.client.write_api import SYNCHRONOUS, WritePrecision
 from os import getenv
 import logging
 import ssl
 import wagglemsg as message
+from contextlib import ExitStack
 
 
 def assert_type(obj, t):
@@ -39,6 +41,99 @@ def coerce_value(x):
     return x
 
 
+class MessageHandler:
+
+    def __init__(self, rabbitmq_conn: pika.BlockingConnection, influxdb_client: InfluxDBClient, influxdb_bucket: str,
+            influxdb_org: str, max_flush_interval: float, max_batch_size: int):
+        self.rabbitmq_conn = rabbitmq_conn
+        self.influxdb_client = influxdb_client
+        self.influxdb_bucket = influxdb_bucket
+        self.influxdb_org = influxdb_org
+        self.max_flush_interval = max_flush_interval
+        self.max_batch_size = max_batch_size
+        self.batch = []
+
+    def flush(self):
+        logging.info("flushing batch with %d records", len(self.batch))
+        records = []
+
+        # create records from batch
+        for ch, method, properties, body in self.batch:
+            try:
+                msg = message.load(body)
+            except Exception:
+                logging.exception("failed to parse message")
+                continue
+
+            try:
+                assert_valid_message(msg)
+            except Exception:
+                logging.exception("dropping invalid message: %s", msg)
+                continue
+
+            # check that meta["node"] matches user_id
+            if "node-"+msg.meta["node"] != properties.user_id:
+                logging.info("dropping invalid message: username (%s) doesn't match node meta (%s) - ", msg.meta["node"], properties.user_id)
+                continue
+
+            logging.debug("creating record for msg: %s value-type: %s", msg, type(msg.value))
+            records.append({
+                "measurement": msg.name,
+                "tags": msg.meta,
+                "fields": {
+                    "value": coerce_value(msg.value),
+                },
+                "time": msg.timestamp,
+            })
+
+        # write entire batch to influxdb
+        logging.info("writing %d records to influxdb", len(records))
+        with self.influxdb_client.write_api(write_options=SYNCHRONOUS) as write_api:
+            try:
+                write_api.write(self.influxdb_bucket, self.influxdb_org, records, write_precision=WritePrecision.NS)
+            except InfluxDBError as exc:
+                # TODO(sean) InfluxDB only responds with single invalid data point message.
+                # Although the write goes through for the valid data points, getting this info
+                # could be helpful for debugging. We may need to leverage a known schema later
+                # to be more proactive about the problem.
+                logging.error("error when writing batch: %s", exc.message)
+
+        # ack entire batch
+        for ch, method, properties, body in self.batch:
+            ch.basic_ack(method.delivery_tag)
+
+        self.batch.clear()
+        logging.info("flushed batch")
+
+    def handle(self, ch, method, properties, body):
+        # ensure we flush new batch within 1s
+        if len(self.batch) == 0:
+            self.rabbitmq_conn.call_later(self.max_flush_interval, self.flush)
+
+        self.batch.append((ch, method, properties, body))
+
+        # ensure we flush when batch is large enough
+        if len(self.batch) >= self.max_batch_size:
+            self.flush()
+
+
+def get_pika_credentials(args):
+    if args.rabbitmq_username != "":
+        return pika.PlainCredentials(args.rabbitmq_username, args.rabbitmq_password)
+    return pika.credentials.ExternalCredentials()
+
+
+def get_ssl_options(args):
+    if args.rabbitmq_cacertfile == "":
+        return None
+    context = ssl.create_default_context(cafile=args.rabbitmq_cacertfile)
+    # HACK this allows the host and baked in host to be configured independently
+    context.check_hostname = False
+    if args.rabbitmq_certfile != "":
+        context.load_cert_chain(args.rabbitmq_certfile, args.rabbitmq_keyfile)
+    return pika.SSLOptions(context, args.rabbitmq_host)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--debug", action="store_true")
@@ -55,7 +150,8 @@ def main():
     parser.add_argument("--influxdb_token", default=getenv("INFLUXDB_TOKEN"))
     parser.add_argument("--influxdb_bucket", default=getenv("INFLUXDB_BUCKET", "waggle"))
     parser.add_argument("--influxdb_org", default=getenv("INFLUXDB_ORG", "waggle"))
-    
+    parser.add_argument("--max_flush_interval", default=getenv("MAX_FLUSH_INTERVAL", "1.0"), type=float, help="max flush interval")
+    parser.add_argument("--max_batch_size", default=getenv("MAX_BATCH_SIZE", "5000"), type=int, help="max batch size")
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -65,76 +161,8 @@ def main():
     # pika logging is too verbose, so we turn it down.
     logging.getLogger("pika").setLevel(logging.CRITICAL)
 
-    logging.info("connecting to influxdb at %s", args.influxdb_url)
-    client = influxdb_client.InfluxDBClient(
-        url=args.influxdb_url,
-        token=args.influxdb_token,
-        org=args.influxdb_org)
-    logging.info("connected to influxdb")
-
-    # TODO(sean) switch to using batch mode
-    writer = client.write_api(write_options=SYNCHRONOUS)
-
-    def message_handler(ch, method, properties, body):
-        try:
-            msg = message.load(body)
-        except Exception:
-            logging.exception("failed to parse message")
-            ch.basic_ack(method.delivery_tag)
-            return
-        
-        try:
-            assert_valid_message(msg)
-        except Exception:
-            logging.exception("dropping invalid message: %s", msg)
-            ch.basic_ack(method.delivery_tag)
-            return
-
-        # check that meta["node"] matches user_id
-        if "node-"+msg.meta["node"] != properties.user_id:
-            logging.info("dropping invalid message: username (%s) doesn't match node meta (%s) - ", msg.meta["node"], properties.user_id)
-            ch.basic_ack(method.delivery_tag)
-            return
-
-        logging.debug("creating record for msg: %s value-type: %s", msg, type(msg.value))
-
-        record = {
-            "measurement": msg.name,
-            "tags": msg.meta,
-            "fields": {
-                "value": coerce_value(msg.value),
-            },
-            "time": msg.timestamp,
-        }
-
-        # TODO(sean) clean this error handling up
-        # NOTE(sean) example of the kind of errors influxdb client can throw
-        # HTTP response headers: HTTPHeaderDict({'Content-Type': 'application/json; charset=utf-8', 'X-Platform-Error-Code': 'internal error', 'Date': 'Mon, 20 Sep 2021 20:44:21 GMT', 'Content-Length': '227'})
-        # HTTP response body: {"code":"internal error","message":"unexpected error writing points to database: partial write: field type conflict: input field \"value\" on measurement \"sys.thermal\" is type integer, already exists as type float dropped=1"}
-        try:
-            writer.write(bucket=args.influxdb_bucket, org=args.influxdb_org, record=record, write_precision=WritePrecision.NS)
-        except influxdb_client.rest.ApiException:
-            logging.exception("error when writing point: %s", msg)
-            ch.basic_ack(method.delivery_tag)
-            return
-
-        ch.basic_ack(method.delivery_tag)
-        logging.debug("proccessed message %s", msg)
-
-    if args.rabbitmq_username != "":
-        credentials = pika.PlainCredentials(args.rabbitmq_username, args.rabbitmq_password)
-    else:
-        credentials = pika.credentials.ExternalCredentials()
-
-    if args.rabbitmq_cacertfile != "":
-        context = ssl.create_default_context(cafile=args.rabbitmq_cacertfile)
-        # HACK this allows the host and baked in host to be configured independently
-        context.check_hostname = False
-        if args.rabbitmq_certfile != "":
-            context.load_cert_chain(args.rabbitmq_certfile, args.rabbitmq_keyfile)
-        ssl_options = pika.SSLOptions(context, args.rabbitmq_host)
-    else:
-        ssl_options = None
+    credentials = get_pika_credentials(args)
+    ssl_options = get_ssl_options(args)
 
     params = pika.ConnectionParameters(
         host=args.rabbitmq_host,
@@ -144,12 +172,34 @@ def main():
         retry_delay=60,
         socket_timeout=10.0)
 
-    conn = pika.BlockingConnection(params)
-    ch = conn.channel()
-    ch.queue_declare(args.rabbitmq_queue, durable=True)
-    ch.queue_bind(args.rabbitmq_queue, args.rabbitmq_exchange, "#")
-    ch.basic_consume(args.rabbitmq_queue, message_handler)
-    ch.start_consuming()
+    with ExitStack() as es:
+        logging.info("connecting to influxdb at %s", args.influxdb_url)
+        client = es.enter_context(InfluxDBClient(
+            url=args.influxdb_url,
+            token=args.influxdb_token,
+            org=args.influxdb_org,
+            enable_gzip=True,
+        ))
+        logging.info("connected to influxdb")
+
+        logging.info("connecting to rabbitmq")
+        conn = es.enter_context(pika.BlockingConnection(params))
+        logging.info("connected to rabbitmq")
+
+        ch = conn.channel()
+        ch.queue_declare(args.rabbitmq_queue, durable=True)
+        ch.queue_bind(args.rabbitmq_queue, args.rabbitmq_exchange, "#")
+
+        handler = MessageHandler(
+            rabbitmq_conn=conn,
+            influxdb_client=client,
+            influxdb_bucket=args.influxdb_bucket,
+            influxdb_org=args.influxdb_org,
+            max_flush_interval=args.max_flush_interval,
+            max_batch_size=args.max_batch_size,
+        )
+        ch.basic_consume(args.rabbitmq_queue, handler.handle)
+        ch.start_consuming()
 
 
 if __name__ == "__main__":
