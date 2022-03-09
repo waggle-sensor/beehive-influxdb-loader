@@ -1,0 +1,51 @@
+    {
+        "users": [
+            {
+                "name":"admin",
+                "password":"admin",
+                "tags": "administrator,impersonator"
+            },
+            {
+                "name":"node-0000000000000001",
+                "password":"waggle",
+                "tags": ""
+            }
+        ],
+        "vhosts": [
+            {
+                "name": "/"
+            }
+        ],
+        "permissions": [
+            {
+                "user": "admin",
+                "vhost": "/",
+                "configure": ".*",
+                "write": ".*",
+                "read": ".*"
+            },
+            {
+                "user": "node-0000000000000001",
+                "vhost": "/",
+                "configure": ".*",
+                "write": ".*",
+                "read": ".*"
+            }
+        ],
+        "topic_permissions": [],
+        "parameters": [],
+        "policies": [],
+        "queues": [],
+        "exchanges": [
+            {
+                "name": "waggle.msg",
+                "vhost": "/",
+                "type": "topic",
+                "durable": true,
+                "auto_delete": false,
+                "internal": false,
+                "arguments": {}
+            }
+        ],
+        "bindings": []
+    }
