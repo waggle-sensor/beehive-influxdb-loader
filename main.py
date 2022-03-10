@@ -160,7 +160,7 @@ def main():
     parser.add_argument("--influxdb_org", default=getenv("INFLUXDB_ORG", "waggle"))
     parser.add_argument("--max_flush_interval", default=getenv("MAX_FLUSH_INTERVAL", "1.0"), type=float, help="max flush interval")
     parser.add_argument("--max_batch_size", default=getenv("MAX_BATCH_SIZE", "5000"), type=int, help="max batch size")
-    parser.add_argument("--metrics_port", default=getenv("METRIC_PORT", "8000"), type=int, help="port to expose metrics")
+    parser.add_argument("--metrics_port", default=getenv("METRICS_PORT", "8080"), type=int, help="port to expose metrics")
     args = parser.parse_args()
 
     logging.basicConfig(
