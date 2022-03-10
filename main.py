@@ -8,6 +8,9 @@ import logging
 import ssl
 import wagglemsg as message
 from contextlib import ExitStack
+from prometheus_client import start_http_server, Counter
+
+messages_processed_total = Counter("loader_messages_processed_total", "Total messages processed by data loader.")
 
 
 def assert_type(obj, t):
@@ -54,6 +57,9 @@ class MessageHandler:
         self.batch = []
 
     def flush(self):
+        if len(self.batch) == 0:
+            return
+
         logging.info("flushing batch with %d records", len(self.batch))
         records = []
 
@@ -103,11 +109,12 @@ class MessageHandler:
         for ch, method, properties, body in self.batch:
             ch.basic_ack(method.delivery_tag)
 
+        messages_processed_total.inc(len(self.batch))
         self.batch.clear()
         logging.info("flushed batch")
 
     def handle(self, ch, method, properties, body):
-        # ensure we flush new batch within 1s
+        # ensure we flush new batch within max flush interval
         if len(self.batch) == 0:
             self.rabbitmq_conn.call_later(self.max_flush_interval, self.flush)
 
@@ -153,6 +160,7 @@ def main():
     parser.add_argument("--influxdb_org", default=getenv("INFLUXDB_ORG", "waggle"))
     parser.add_argument("--max_flush_interval", default=getenv("MAX_FLUSH_INTERVAL", "1.0"), type=float, help="max flush interval")
     parser.add_argument("--max_batch_size", default=getenv("MAX_BATCH_SIZE", "5000"), type=int, help="max batch size")
+    parser.add_argument("--metrics_port", default=getenv("METRIC_PORT", "8000"), type=int, help="port to expose metrics")
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -172,6 +180,8 @@ def main():
         ssl_options=ssl_options,
         retry_delay=60,
         socket_timeout=10.0)
+
+    start_http_server(args.metrics_port)
 
     with ExitStack() as es:
         logging.info("connecting to influxdb at %s", args.influxdb_url)
