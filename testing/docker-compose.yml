@@ -16,6 +16,7 @@ services:
       - DOCKER_INFLUXDB_INIT_BUCKET=waggle
       # NOTE(sean) This token is assumed to be public and should only be used for local testing!
       - DOCKER_INFLUXDB_INIT_ADMIN_TOKEN=zFloIAmPQExH5UL462zl5KsmYE9XBmgT7AU88txHoHm7YnI8MSN14Q==
+    restart: always
 
   rabbitmq:
     image: rabbitmq:3.8.11-management
@@ -25,6 +26,7 @@ services:
     volumes:
       - ./rabbitmq.conf:/etc/rabbitmq/rabbitmq.conf
       - ./definitions.json:/etc/rabbitmq/definitions.json
+    restart: always
 
   loader:
     build: ..
