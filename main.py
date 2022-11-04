@@ -11,7 +11,7 @@ from contextlib import ExitStack
 from prometheus_client import start_http_server, Counter
 
 messages_processed_total = Counter("influxdbloader_messages_processed_total", "Total messages processed by InfluxDB loader.")
-messages_processed_total_bytes = Counter("influxdbloader_messages_processed_total_bytes", "Total message bytes processed by InfluxDB loader.")
+messages_processed_bytes = Counter("influxdbloader_messages_processed_bytes", "Total message bytes processed by InfluxDB loader.")
 
 
 def assert_type(obj, t):
@@ -112,7 +112,7 @@ class MessageHandler:
 
         # update metrics
         messages_processed_total.inc(len(self.batch))
-        messages_processed_total_bytes.inc(sum(len(body) for _, _, _, body in self.batch))
+        messages_processed_bytes.inc(sum(len(body) for _, _, _, body in self.batch))
 
         self.batch.clear()
         logging.info("flushed batch")
