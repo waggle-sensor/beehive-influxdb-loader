@@ -9,9 +9,13 @@ import ssl
 import wagglemsg as message
 from contextlib import ExitStack
 from prometheus_client import start_http_server, Counter
+from collections import defaultdict
 
 messages_processed_total = Counter("influxdbloader_messages_processed_total", "Total messages processed by InfluxDB loader.")
 messages_processed_bytes = Counter("influxdbloader_messages_processed_bytes", "Total message bytes processed by InfluxDB loader.")
+
+messages_processed_total_by_vsn_total = Counter("influxdbloader_messages_processed_total_by_vsn_total", "Total messages processed by InfluxDB loader by VSN.", ["vsn"])
+messages_processed_bytes_by_vsn = Counter("influxdbloader_messages_processed_bytes_by_vsn", "Total message bytes processed by InfluxDB loader by VSN.", ["vsn"])
 
 
 def assert_type(obj, t):
@@ -62,7 +66,10 @@ class MessageHandler:
             return
 
         logging.info("flushing batch with %d records", len(self.batch))
+
         records = []
+        batch_messages_by_vsn_total = defaultdict(int)
+        batch_bytes_by_vsn_total = defaultdict(int)
 
         # create records from batch
         for ch, method, properties, body in self.batch:
@@ -93,6 +100,12 @@ class MessageHandler:
                 "time": msg.timestamp,
             })
 
+            # update per vsn metrics
+            # TODO(sean) clean up and better isolate metrics aggregation
+            vsn = msg.meta.get("vsn", "")
+            batch_messages_by_vsn_total[vsn] += 1
+            batch_bytes_by_vsn_total[vsn] += len(body)
+
         # write entire batch to influxdb
         logging.info("writing %d records to influxdb", len(records))
         with self.influxdb_client.write_api(write_options=SYNCHRONOUS) as write_api:
@@ -113,6 +126,12 @@ class MessageHandler:
         # update metrics
         messages_processed_total.inc(len(self.batch))
         messages_processed_bytes.inc(sum(len(body) for _, _, _, body in self.batch))
+
+        for vsn, total in batch_messages_by_vsn_total.items():
+            messages_processed_total_by_vsn_total.labels(vsn).inc(total)
+
+        for vsn, total in batch_bytes_by_vsn_total.items():
+            messages_processed_bytes_by_vsn.labels(vsn).inc(total)
 
         self.batch.clear()
         logging.info("flushed batch")
