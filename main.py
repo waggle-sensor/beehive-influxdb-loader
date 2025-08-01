@@ -11,11 +11,25 @@ from contextlib import ExitStack
 from prometheus_client import start_http_server, Counter
 from collections import defaultdict
 
-messages_processed_total = Counter("influxdbloader_messages_processed_total", "Total messages processed by InfluxDB loader.")
-messages_processed_bytes = Counter("influxdbloader_messages_processed_bytes", "Total message bytes processed by InfluxDB loader.")
+messages_processed_total = Counter(
+    "influxdbloader_messages_processed_total",
+    "Total messages processed by InfluxDB loader.",
+)
+messages_processed_bytes = Counter(
+    "influxdbloader_messages_processed_bytes",
+    "Total message bytes processed by InfluxDB loader.",
+)
 
-messages_processed_total_by_node_total = Counter("influxdbloader_messages_processed_total_by_node_total", "Total messages processed by InfluxDB loader by VSN.", ["node", "vsn"])
-messages_processed_bytes_by_node = Counter("influxdbloader_messages_processed_bytes_by_node", "Total message bytes processed by InfluxDB loader by VSN.", ["node", "vsn"])
+messages_processed_total_by_node_total = Counter(
+    "influxdbloader_messages_processed_total_by_node_total",
+    "Total messages processed by InfluxDB loader by VSN.",
+    ["node", "vsn"],
+)
+messages_processed_bytes_by_node = Counter(
+    "influxdbloader_messages_processed_bytes_by_node",
+    "Total message bytes processed by InfluxDB loader by VSN.",
+    ["node", "vsn"],
+)
 
 
 def assert_type(obj, t):
@@ -50,9 +64,15 @@ def coerce_value(x):
 
 
 class MessageHandler:
-
-    def __init__(self, rabbitmq_conn: pika.BlockingConnection, influxdb_client: InfluxDBClient, influxdb_bucket: str,
-            influxdb_org: str, max_flush_interval: float, max_batch_size: int):
+    def __init__(
+        self,
+        rabbitmq_conn: pika.BlockingConnection,
+        influxdb_client: InfluxDBClient,
+        influxdb_bucket: str,
+        influxdb_org: str,
+        max_flush_interval: float,
+        max_batch_size: int,
+    ):
         self.rabbitmq_conn = rabbitmq_conn
         self.influxdb_client = influxdb_client
         self.influxdb_bucket = influxdb_bucket
@@ -86,19 +106,27 @@ class MessageHandler:
                 continue
 
             # check that meta["node"] matches user_id
-            if "node-"+msg.meta["node"] != properties.user_id:
-                logging.info("dropping invalid message: username (%s) doesn't match node meta (%s) - ", msg.meta["node"], properties.user_id)
+            if "node-" + msg.meta["node"] != properties.user_id:
+                logging.info(
+                    "dropping invalid message: username (%s) doesn't match node meta (%s) - ",
+                    msg.meta["node"],
+                    properties.user_id,
+                )
                 continue
 
-            logging.debug("creating record for msg: %s value-type: %s", msg, type(msg.value))
-            records.append({
-                "measurement": msg.name,
-                "tags": msg.meta,
-                "fields": {
-                    "value": coerce_value(msg.value),
-                },
-                "time": msg.timestamp,
-            })
+            logging.debug(
+                "creating record for msg: %s value-type: %s", msg, type(msg.value)
+            )
+            records.append(
+                {
+                    "measurement": msg.name,
+                    "tags": msg.meta,
+                    "fields": {
+                        "value": coerce_value(msg.value),
+                    },
+                    "time": msg.timestamp,
+                }
+            )
 
             # update per node metrics
             # TODO(sean) clean up and better isolate metrics aggregation
@@ -111,7 +139,12 @@ class MessageHandler:
         logging.info("writing %d records to influxdb", len(records))
         with self.influxdb_client.write_api(write_options=SYNCHRONOUS) as write_api:
             try:
-                write_api.write(self.influxdb_bucket, self.influxdb_org, records, write_precision=WritePrecision.NS)
+                write_api.write(
+                    self.influxdb_bucket,
+                    self.influxdb_org,
+                    records,
+                    write_precision=WritePrecision.NS,
+                )
             except InfluxDBError as exc:
                 # TODO(sean) InfluxDB only responds with single invalid data point message.
                 # Although the write goes through for the valid data points, getting this info
@@ -169,28 +202,56 @@ def get_ssl_options(args):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--debug", action="store_true")
-    parser.add_argument("--rabbitmq_host",default=getenv("RABBITMQ_HOST", "localhost"))
-    parser.add_argument("--rabbitmq_port", default=getenv("RABBITMQ_PORT", "5672"), type=int)
+    parser.add_argument("--rabbitmq_host", default=getenv("RABBITMQ_HOST", "localhost"))
+    parser.add_argument(
+        "--rabbitmq_port", default=getenv("RABBITMQ_PORT", "5672"), type=int
+    )
     parser.add_argument("--rabbitmq_username", default=getenv("RABBITMQ_USERNAME", ""))
     parser.add_argument("--rabbitmq_password", default=getenv("RABBITMQ_PASSWORD", ""))
-    parser.add_argument("--rabbitmq_cacertfile", default=getenv("RABBITMQ_CACERTFILE", ""))
+    parser.add_argument(
+        "--rabbitmq_cacertfile", default=getenv("RABBITMQ_CACERTFILE", "")
+    )
     parser.add_argument("--rabbitmq_certfile", default=getenv("RABBITMQ_CERTFILE", ""))
     parser.add_argument("--rabbitmq_keyfile", default=getenv("RABBITMQ_KEYFILE", ""))
-    parser.add_argument("--rabbitmq_exchange", default=getenv("RABBITMQ_EXCHANGE", "waggle.msg"))
-    parser.add_argument("--rabbitmq_queue", default=getenv("RABBITMQ_QUEUE", "influx-messages"))
-    parser.add_argument("--influxdb_url", default=getenv("INFLUXDB_URL", "http://localhost:8086"))
+    parser.add_argument(
+        "--rabbitmq_exchange", default=getenv("RABBITMQ_EXCHANGE", "waggle.msg")
+    )
+    parser.add_argument(
+        "--rabbitmq_queue", default=getenv("RABBITMQ_QUEUE", "influx-messages")
+    )
+    parser.add_argument(
+        "--influxdb_url", default=getenv("INFLUXDB_URL", "http://localhost:8086")
+    )
     parser.add_argument("--influxdb_token", default=getenv("INFLUXDB_TOKEN"))
-    parser.add_argument("--influxdb_bucket", default=getenv("INFLUXDB_BUCKET", "waggle"))
+    parser.add_argument(
+        "--influxdb_bucket", default=getenv("INFLUXDB_BUCKET", "waggle")
+    )
     parser.add_argument("--influxdb_org", default=getenv("INFLUXDB_ORG", "waggle"))
-    parser.add_argument("--max_flush_interval", default=getenv("MAX_FLUSH_INTERVAL", "1.0"), type=float, help="max flush interval")
-    parser.add_argument("--max_batch_size", default=getenv("MAX_BATCH_SIZE", "5000"), type=int, help="max batch size")
-    parser.add_argument("--metrics_port", default=getenv("METRICS_PORT", "8080"), type=int, help="port to expose metrics")
+    parser.add_argument(
+        "--max_flush_interval",
+        default=getenv("MAX_FLUSH_INTERVAL", "1.0"),
+        type=float,
+        help="max flush interval",
+    )
+    parser.add_argument(
+        "--max_batch_size",
+        default=getenv("MAX_BATCH_SIZE", "5000"),
+        type=int,
+        help="max batch size",
+    )
+    parser.add_argument(
+        "--metrics_port",
+        default=getenv("METRICS_PORT", "8080"),
+        type=int,
+        help="port to expose metrics",
+    )
     args = parser.parse_args()
 
     logging.basicConfig(
         level=logging.DEBUG if args.debug else logging.INFO,
         format="%(asctime)s %(message)s",
-        datefmt="%Y/%m/%d %H:%M:%S")
+        datefmt="%Y/%m/%d %H:%M:%S",
+    )
     # pika logging is too verbose, so we turn it down.
     logging.getLogger("pika").setLevel(logging.CRITICAL)
 
@@ -203,18 +264,21 @@ def main():
         credentials=credentials,
         ssl_options=ssl_options,
         retry_delay=60,
-        socket_timeout=10.0)
+        socket_timeout=10.0,
+    )
 
     start_http_server(args.metrics_port)
 
     with ExitStack() as es:
         logging.info("connecting to influxdb at %s", args.influxdb_url)
-        client = es.enter_context(InfluxDBClient(
-            url=args.influxdb_url,
-            token=args.influxdb_token,
-            org=args.influxdb_org,
-            enable_gzip=True,
-        ))
+        client = es.enter_context(
+            InfluxDBClient(
+                url=args.influxdb_url,
+                token=args.influxdb_token,
+                org=args.influxdb_org,
+                enable_gzip=True,
+            )
+        )
         logging.info("connected to influxdb")
 
         logging.info("connecting to rabbitmq")

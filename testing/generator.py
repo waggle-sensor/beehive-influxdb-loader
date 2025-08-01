@@ -18,7 +18,7 @@ with pika.BlockingConnection(params) as conn:
             name="env.temperature",
             value=value,
             timestamp=time.time_ns(),
-            meta={"node": "0000000000000001"}
+            meta={"node": "0000000000000001"},
         )
         body = wagglemsg.dump(msg)
         properties = pika.BasicProperties(user_id="node-0000000000000001")
