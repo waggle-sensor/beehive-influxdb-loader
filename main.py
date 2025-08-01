@@ -245,6 +245,12 @@ def main():
         type=int,
         help="port to expose metrics",
     )
+    parser.add_argument(
+        "--prefetch_count",
+        default=getenv("PREFETCH_COUNT", "10000"),
+        type=int,
+        help="prefetch count to use for consumer",
+    )
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -288,6 +294,7 @@ def main():
         ch = conn.channel()
         ch.queue_declare(args.rabbitmq_queue, durable=True)
         ch.queue_bind(args.rabbitmq_queue, args.rabbitmq_exchange, "#")
+        ch.basic_qos(prefetch_count=args.prefetch_count)
 
         handler = MessageHandler(
             rabbitmq_conn=conn,
