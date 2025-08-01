@@ -257,7 +257,6 @@ def main():
     parser.add_argument(
         "--ssl_no_verify",
         action="store_true",
-        type=bool,
         help="disable ssl host verification. please only use for debugging!",
     )
     args = parser.parse_args()
