@@ -194,6 +194,9 @@ def get_ssl_options(args):
     context = ssl.create_default_context(cafile=args.rabbitmq_cacertfile)
     # HACK this allows the host and baked in host to be configured independently
     context.check_hostname = False
+    if args.ssl_no_verify:
+        context.verify_mode = ssl.CERT_NONE
+        return pika.SSLOptions(context, args.rabbitmq_host)
     if args.rabbitmq_certfile != "":
         context.load_cert_chain(args.rabbitmq_certfile, args.rabbitmq_keyfile)
     return pika.SSLOptions(context, args.rabbitmq_host)
@@ -250,6 +253,12 @@ def main():
         default=getenv("PREFETCH_COUNT", "10000"),
         type=int,
         help="prefetch count to use for consumer",
+    )
+    parser.add_argument(
+        "--ssl_no_verify",
+        action="store_true",
+        type=bool,
+        help="disable ssl host verification. please only use for debugging!",
     )
     args = parser.parse_args()
 
