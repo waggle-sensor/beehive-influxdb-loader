@@ -231,6 +231,11 @@ def main():
     )
     parser.add_argument("--influxdb_org", default=getenv("INFLUXDB_ORG", "waggle"))
     parser.add_argument(
+        "--influxdb_connection_timeout",
+        type=int,
+        default=getenv("INFLUXDB_CONNECTION_TIMEOUT", "10000"),
+    )
+    parser.add_argument(
         "--max_flush_interval",
         default=getenv("MAX_FLUSH_INTERVAL", "1.0"),
         type=float,
@@ -290,6 +295,7 @@ def main():
                 url=args.influxdb_url,
                 token=args.influxdb_token,
                 org=args.influxdb_org,
+                timeout=args.influxdb_connection_timeout,
                 enable_gzip=True,
             )
         )
