@@ -194,6 +194,9 @@ def get_ssl_options(args):
     context = ssl.create_default_context(cafile=args.rabbitmq_cacertfile)
     # HACK this allows the host and baked in host to be configured independently
     context.check_hostname = False
+    if args.ssl_no_verify:
+        context.verify_mode = ssl.CERT_NONE
+        return pika.SSLOptions(context, args.rabbitmq_host)
     if args.rabbitmq_certfile != "":
         context.load_cert_chain(args.rabbitmq_certfile, args.rabbitmq_keyfile)
     return pika.SSLOptions(context, args.rabbitmq_host)
@@ -228,6 +231,11 @@ def main():
     )
     parser.add_argument("--influxdb_org", default=getenv("INFLUXDB_ORG", "waggle"))
     parser.add_argument(
+        "--influxdb_connection_timeout",
+        type=int,
+        default=getenv("INFLUXDB_CONNECTION_TIMEOUT", "10000"),
+    )
+    parser.add_argument(
         "--max_flush_interval",
         default=getenv("MAX_FLUSH_INTERVAL", "1.0"),
         type=float,
@@ -244,6 +252,17 @@ def main():
         default=getenv("METRICS_PORT", "8080"),
         type=int,
         help="port to expose metrics",
+    )
+    parser.add_argument(
+        "--prefetch_count",
+        default=getenv("PREFETCH_COUNT", "10000"),
+        type=int,
+        help="prefetch count to use for consumer",
+    )
+    parser.add_argument(
+        "--ssl_no_verify",
+        action="store_true",
+        help="disable ssl host verification. please only use for debugging!",
     )
     args = parser.parse_args()
 
@@ -276,6 +295,7 @@ def main():
                 url=args.influxdb_url,
                 token=args.influxdb_token,
                 org=args.influxdb_org,
+                timeout=args.influxdb_connection_timeout,
                 enable_gzip=True,
             )
         )
@@ -288,6 +308,7 @@ def main():
         ch = conn.channel()
         ch.queue_declare(args.rabbitmq_queue, durable=True)
         ch.queue_bind(args.rabbitmq_queue, args.rabbitmq_exchange, "#")
+        ch.basic_qos(prefetch_count=args.prefetch_count)
 
         handler = MessageHandler(
             rabbitmq_conn=conn,
