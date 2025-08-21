@@ -152,6 +152,10 @@ class MessageHandler:
                 # to be more proactive about the problem.
                 logging.error("error when writing batch: %s", exc.message)
 
+                # For a write timeout, we want to fail and retry the whole batch.
+                if "timeout" in exc.message:
+                    raise
+
         # ack entire batch
         logging.info("acking batch")
         for ch, method, properties, body in self.batch:
