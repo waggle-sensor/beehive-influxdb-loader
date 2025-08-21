@@ -150,7 +150,13 @@ class MessageHandler:
                 # Although the write goes through for the valid data points, getting this info
                 # could be helpful for debugging. We may need to leverage a known schema later
                 # to be more proactive about the problem.
-                logging.error("error when writing batch: %s", exc.message)
+                msg = str(exc.message)
+
+                logging.error("error when writing batch: %s", msg)
+
+                # For a write timeout, we want to fail and retry the whole batch.
+                if "timeout" in msg:
+                    raise
 
         # ack entire batch
         logging.info("acking batch")
