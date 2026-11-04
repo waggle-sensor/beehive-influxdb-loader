@@ -1,16 +1,30 @@
+"""Consume Waggle measurements from RabbitMQ and write them to Influx.
+
+A batch is acknowledged only after its durable work finishes: the hot write,
+any late-inbox receipt, permit release, and quarantine of invalid deliveries.
+A failed flush stops consumption and leaves that batch unacknowledged. An
+empty archival URL writes every valid record straight to Influx and quarantines
+invalid originals on the local broker queue.
+"""
 import argparse
+import base64
+import json
+import uuid
+from archive import ArchiveClient, day_for_ns
 import pika
 from influxdb_client import InfluxDBClient
-from influxdb_client.client.exceptions import InfluxDBError
 from influxdb_client.client.write_api import SYNCHRONOUS, WritePrecision
 from os import getenv
 import logging
+import math
 import ssl
 import wagglemsg as message
-from contextlib import ExitStack
+from contextlib import ExitStack, nullcontext
 from prometheus_client import start_http_server, Counter
 from collections import defaultdict
 
+# Counters move only after acknowledgement. Unlabeled totals include invalid
+# deliveries; the node and VSN series count valid records only.
 messages_processed_total = Counter(
     "influxdbloader_messages_processed_total",
     "Total messages processed by InfluxDB loader.",
@@ -43,10 +57,18 @@ def assert_maxlen(s, n):
 
 
 def assert_valid_message(msg):
+    """Require a short name, int64 nanoseconds, a finite scalar, and string metadata.
+
+    `node` is required. The broker user is checked by the caller against this tag.
+    """
     assert_type(msg.name, str)
     assert_maxlen(msg.name, 64)
     assert_type(msg.timestamp, int)
+    if isinstance(msg.timestamp, bool) or not -(1 << 63) <= msg.timestamp < (1 << 63):
+        raise ValueError("timestamp outside nanosecond int64 range")
     assert_type(msg.value, (int, float, str))
+    if isinstance(msg.value, float) and not math.isfinite(msg.value):
+        raise ValueError("nonfinite observation")
     assert_type(msg.meta, dict)
     for k, v in msg.meta.items():
         assert_type(k, str)
@@ -58,12 +80,19 @@ def assert_valid_message(msg):
 
 
 def coerce_value(x):
+    """Store an integer observation as a float. Strings stay strings."""
     if isinstance(x, int):
         return float(x)
     return x
 
 
 class MessageHandler:
+    """One in-memory batch. Its attempt id is the idempotency key for that flush.
+
+    The key is reused if this process retries the same batch. A restart mints
+    another key, so a repeated hot write is possible and a late receipt is a
+    new archiver request.
+    """
     def __init__(
         self,
         rabbitmq_conn: pika.BlockingConnection,
@@ -72,6 +101,7 @@ class MessageHandler:
         influxdb_org: str,
         max_flush_interval: float,
         max_batch_size: int,
+        archive_client=None,
     ):
         self.rabbitmq_conn = rabbitmq_conn
         self.influxdb_client = influxdb_client
@@ -80,97 +110,88 @@ class MessageHandler:
         self.max_flush_interval = max_flush_interval
         self.max_batch_size = max_batch_size
         self.batch = []
+        self.archive = archive_client
+        self.attempt = None
 
     def flush(self):
-        if len(self.batch) == 0:
+        """Validate, route, persist, then acknowledge every delivery in the batch.
+
+        Invalid bodies are quarantined and left out of the write set, then
+        acknowledged with the rest once quarantine succeeds. Coordinated mode
+        writes only days the archiver still calls hot. Other days go to the
+        late inbox. A coordinator or write failure does not fall back to a
+        direct Influx write, and it does not acknowledge the batch.
+        """
+        if not self.batch:
             return
-
-        logging.info("flushing batch with %d records", len(self.batch))
-
+        # A failed flush ends consumption, leaving broker deliveries unacked.
+        # Within a flush, HTTP retries use a stable idempotency key.
+        if self.attempt is None:
+            self.attempt = uuid.uuid4().hex
         records = []
-        batch_messages_by_node_total = defaultdict(int)
-        batch_bytes_by_node_total = defaultdict(int)
-
-        # create records from batch
-        for ch, method, properties, body in self.batch:
+        bytes_by_node = defaultdict(int)
+        for index, (ch, method, properties, body) in enumerate(self.batch):
             try:
                 msg = message.load(body)
-            except Exception:
-                logging.exception("failed to parse message")
-                continue
-
-            try:
                 assert_valid_message(msg)
-            except Exception:
-                logging.exception("dropping invalid message: %s", msg)
-                continue
+                if "node-" + msg.meta["node"] != properties.user_id:
+                    raise ValueError("RabbitMQ user does not match node tag")
+                records.append(dict(measurement=msg.name, tags=msg.meta,
+                                    fields={"value": coerce_value(msg.value)}, time=msg.timestamp))
+                bytes_by_node[(msg.meta.get("node", ""), msg.meta.get("vsn", ""))] += len(body)
+            except Exception as error:
+                # Retain invalid originals durably; do not acknowledge a log line.
+                payload = json.dumps(dict(body=base64.b64encode(body).decode(),
+                                          user_id=properties.user_id, reason=str(error)))
+                if self.archive:
+                    self.archive.quarantine(f"{self.attempt}/invalid/{index}", payload)
+                else:
+                    # Use a separate confirmed publisher; never ack an unrouted quarantine.
+                    pub = self.rabbitmq_conn.channel()
+                    try:
+                        pub.queue_declare("influx-messages-quarantine", durable=True)
+                        pub.confirm_delivery()
+                        pub.basic_publish("", "influx-messages-quarantine", payload.encode(),
+                                          properties=pika.BasicProperties(delivery_mode=2), mandatory=True)
+                    finally:
+                        pub.close()
 
-            # check that meta["node"] matches user_id
-            if "node-" + msg.meta["node"] != properties.user_id:
-                logging.info(
-                    "dropping invalid message: username (%s) doesn't match node meta (%s) - ",
-                    msg.meta["node"],
-                    properties.user_id,
-                )
-                continue
-
-            logging.debug(
-                "creating record for msg: %s value-type: %s", msg, type(msg.value)
-            )
-            records.append(
-                {
-                    "measurement": msg.name,
-                    "tags": msg.meta,
-                    "fields": {
-                        "value": coerce_value(msg.value),
-                    },
-                    "time": msg.timestamp,
-                }
-            )
-
-            # update per node metrics
-            # TODO(sean) clean up and better isolate metrics aggregation
-            node = msg.meta.get("node", "")
-            vsn = msg.meta.get("vsn", "")
-            batch_messages_by_node_total[(node, vsn)] += 1
-            batch_bytes_by_node_total[(node, vsn)] += len(body)
-
-        # write entire batch to influxdb
-        logging.info("writing %d records to influxdb", len(records))
-        with self.influxdb_client.write_api(write_options=SYNCHRONOUS) as write_api:
-            try:
-                write_api.write(
-                    self.influxdb_bucket,
-                    self.influxdb_org,
-                    records,
-                    write_precision=WritePrecision.NS,
-                )
-            except InfluxDBError as exc:
-                # TODO(sean) InfluxDB only responds with single invalid data point message.
-                # Although the write goes through for the valid data points, getting this info
-                # could be helpful for debugging. We may need to leverage a known schema later
-                # to be more proactive about the problem.
-                logging.error("error when writing batch: %s", exc.message)
-
-        # ack entire batch
-        logging.info("acking batch")
+        context = (self.archive.acquire_lease(self.attempt, [day_for_ns(r["time"]) for r in records])
+                   if self.archive and records else nullcontext())
+        with context as lease:
+            if lease is not None:
+                hot = [r for r in records if day_for_ns(r["time"]) in lease.hot_days]
+                late = [r for r in records if day_for_ns(r["time"]) not in lease.hot_days]
+                if late:
+                    lease.check()
+                    self.archive.enqueue(self.attempt, late)
+            else:
+                hot = records
+            if hot:
+                if lease is not None:
+                    lease.check()
+                with self.influxdb_client.write_api(write_options=SYNCHRONOUS) as write_api:
+                    # Partial writes and uncertain outcomes never acknowledge a batch.
+                    # The background lease stops on failure; broker replay re-routes it.
+                    write_api.write(self.influxdb_bucket, self.influxdb_org, hot,
+                                    write_precision=WritePrecision.NS)
+            if lease is not None:
+                lease.check()
+                lease.finish()
         for ch, method, properties, body in self.batch:
             ch.basic_ack(method.delivery_tag)
-
-        # update metrics
         messages_processed_total.inc(len(self.batch))
         messages_processed_bytes.inc(sum(len(body) for _, _, _, body in self.batch))
-
-        for (node, vsn), total in batch_messages_by_node_total.items():
-            messages_processed_total_by_node_total.labels(node, vsn).inc(total)
-
-        for (node, vsn), total in batch_bytes_by_node_total.items():
-            messages_processed_bytes_by_node.labels(node, vsn).inc(total)
-
+        for record in records:
+            tags = record["tags"]
+            messages_processed_total_by_node_total.labels(tags.get("node", ""), tags.get("vsn", "")).inc()
+        for (node, vsn), size in bytes_by_node.items():
+            messages_processed_bytes_by_node.labels(node, vsn).inc(size)
         self.batch.clear()
-        logging.info("flushed batch")
+        self.attempt = None
 
     def handle(self, ch, method, properties, body):
+        """Buffer one delivery. The first message arms the flush timer."""
         # ensure we flush new batch within max flush interval
         if len(self.batch) == 0:
             self.rabbitmq_conn.call_later(self.max_flush_interval, self.flush)
@@ -183,12 +204,18 @@ class MessageHandler:
 
 
 def get_pika_credentials(args):
+    """Use a username and password, or the broker's external auth when the username is empty."""
     if args.rabbitmq_username != "":
         return pika.PlainCredentials(args.rabbitmq_username, args.rabbitmq_password)
     return pika.credentials.ExternalCredentials()
 
 
 def get_ssl_options(args):
+    """Return TLS options, or None when no CA bundle is configured.
+
+    Hostname checking stays off so the dial host and the certificate name can
+    differ. `--ssl_no_verify` also skips certificate verification.
+    """
     if args.rabbitmq_cacertfile == "":
         return None
     context = ssl.create_default_context(cafile=args.rabbitmq_cacertfile)
@@ -203,6 +230,12 @@ def get_ssl_options(args):
 
 
 def main():
+    """Consume until a flush fails.
+
+    A set archival URL requires the loader token, an owner prefix, and a
+    positive Influx timeout. ArchiveClient appends a process UUID to that
+    prefix. The metrics port has no authentication.
+    """
     parser = argparse.ArgumentParser()
     parser.add_argument("--debug", action="store_true")
     parser.add_argument("--rabbitmq_host", default=getenv("RABBITMQ_HOST", "localhost"))
@@ -264,7 +297,15 @@ def main():
         action="store_true",
         help="disable ssl host verification. please only use for debugging!",
     )
+    parser.add_argument("--hot-to-cold-loader.url", dest="hot_to_cold_loader_url", default=getenv("HOT_TO_COLD_LOADER_URL", ""))
+    parser.add_argument("--hot-to-cold-loader.loader-token", dest="hot_to_cold_loader_token", default=getenv("HOT_TO_COLD_LOADER_LOADER_TOKEN", ""))
+    parser.add_argument("--hot-to-cold-loader.loader-owner", dest="hot_to_cold_loader_owner", default=getenv("HOT_TO_COLD_LOADER_LOADER_OWNER", ""))
     args = parser.parse_args()
+    if args.hot_to_cold_loader_url and (not args.hot_to_cold_loader_token or not args.hot_to_cold_loader_owner):
+        parser.error("hot-to-cold-loader.url requires hot-to-cold-loader.loader-token and a unique hot-to-cold-loader.loader-owner (pod UID)")
+
+    if args.hot_to_cold_loader_url and args.influxdb_connection_timeout <= 0:
+        parser.error("coordinated writes require a positive influxdb_connection_timeout")
 
     logging.basicConfig(
         level=logging.DEBUG if args.debug else logging.INFO,
@@ -317,6 +358,9 @@ def main():
             influxdb_org=args.influxdb_org,
             max_flush_interval=args.max_flush_interval,
             max_batch_size=args.max_batch_size,
+            archive_client=(ArchiveClient(args.hot_to_cold_loader_url, args.hot_to_cold_loader_token,
+                                          args.influxdb_bucket, args.hot_to_cold_loader_owner)
+                            if args.hot_to_cold_loader_url else None),
         )
         ch.basic_consume(args.rabbitmq_queue, handler.handle)
         ch.start_consuming()

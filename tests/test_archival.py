@@ -6,7 +6,7 @@ from types import SimpleNamespace
 from unittest import TestCase, main
 from unittest.mock import Mock, patch
 
-from archive import cold_record, day_for_ns
+from archive import cold_record, day_for_ns, WriteLeaseLost
 from main import MessageHandler
 
 
@@ -17,7 +17,12 @@ class TestArchival(TestCase):
         influx.write_api.return_value.__exit__ = Mock(return_value=False)
         coord = Mock() if archive else None
         if coord:
-            coord.acquire.return_value = {"2025-05-01"}
+            lease = Mock()
+            lease.hot_days = {"2025-05-01"}
+            lease.__enter__ = Mock(return_value=lease)
+            lease.__exit__ = Mock(return_value=False)
+            lease.finish.side_effect = lambda: coord.release("batch")
+            coord.acquire_lease.return_value = lease
         handler = MessageHandler(conn, influx, "waggle", "waggle", 1, 5000, coord)
         return handler, influx.write_api.return_value, coord
 
@@ -55,6 +60,34 @@ class TestArchival(TestCase):
             handler.flush()
         channel.basic_ack.assert_not_called()
         coord.release.assert_not_called()
+
+    def test_lease_loss_after_write_never_releases_or_acknowledges(self):
+        handler, writer, coord = self.make_handler()
+        channel = self.delivery(handler, 1746057600000000194, 1)
+        coord.acquire_lease.return_value.check.side_effect = [None, WriteLeaseLost("expired")]
+        with patch("main.message.load", side_effect=self.parse), self.assertRaises(WriteLeaseLost):
+            handler.flush()
+        writer.write.assert_called_once()
+        channel.basic_ack.assert_not_called()
+        coord.release.assert_not_called()
+
+    def test_lease_loss_before_write_prevents_hot_io(self):
+        handler, writer, coord = self.make_handler()
+        channel = self.delivery(handler, 1746057600000000194, 1)
+        coord.acquire_lease.return_value.check.side_effect = WriteLeaseLost("expired")
+        with patch("main.message.load", side_effect=self.parse), self.assertRaises(WriteLeaseLost):
+            handler.flush()
+        writer.write.assert_not_called()
+        channel.basic_ack.assert_not_called()
+
+    def test_release_failure_leaves_batch_unacknowledged(self):
+        handler, writer, coord = self.make_handler()
+        channel = self.delivery(handler, 1746057600000000194, 1)
+        coord.release.side_effect = RuntimeError("release failed")
+        with patch("main.message.load", side_effect=self.parse), self.assertRaises(RuntimeError):
+            handler.flush()
+        writer.write.assert_called_once()
+        channel.basic_ack.assert_not_called()
 
     def test_inbox_failure_never_acknowledges(self):
         handler, writer, coord = self.make_handler()
