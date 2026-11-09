@@ -1,4 +1,4 @@
-# Beehive InfluxDB loader
+# Beehive InfluxDB loader 
 
 Beehive InfluxDB loader consumes Waggle messages from RabbitMQ and writes each measurement's `value`, metadata tags, and nanosecond timestamp to InfluxDB. Integers are stored as floats. Archival coordination is off until `HOT_TO_COLD_LOADER_URL` is set.
 
